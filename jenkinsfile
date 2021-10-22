@@ -1,0 +1,132 @@
+pipeline {
+
+    options {
+        // Build auto timeout
+        timeout(time: 60, unit: 'MINUTES')
+    }
+
+
+    parameters {
+        string (name: 'GIT_BRANCH',           defaultValue: 'release',  description: 'Git branch to build')
+        booleanParam (name: 'DEPLOY_TO_PROD', defaultValue: false,     description: 'If build and tests are good, proceed and deploy to production without manual approval')
+ }
+   // Printing inputs
+    stages {
+      stage('printing inputs') {
+        steps {
+          script {
+            println "env is ${params.ENV},Image version selected is ${params.VERSION}"  
+              }
+            }
+          }
+        }
+    // Pipeline stages
+    stages {
+
+        ////////// Step 1 //////////
+        stage('Git clone and setup') {
+            steps {
+                echo "Check out nginx code"
+                git branch: "release",
+                        credentialsId: 'gitaccess',
+                        url: 'https://github.com/vinodhkumar/williamhill.git'
+
+                // Validate kubectl
+                sh "kubectl cluster-info"
+
+        ////////// Step 2 //////////
+        stage('Build and tests') {
+            steps {
+                echo "Building application and Docker image"
+                sh "${WORKSPACE}/build.sh --build --registry ${DOCKER_REG} --tag ${DOCKER_TAG} --docker_usr ${DOCKER_USR} --docker_psw ${DOCKER_PSW}"
+
+                echo "Running tests"
+
+                // Kill container in case there is a leftover
+                sh "[ -z \"\$(docker ps -a | grep ${ID} 2>/dev/null)\" ] || docker rm -f ${ID}"
+
+                echo "Starting ${IMAGE_NAME} container"
+                sh "docker run --detach --name ${ID} --rm --publish ${TEST_LOCAL_PORT}:80 ${DOCKER_REG}/${IMAGE_NAME}:${DOCKER_TAG}"
+
+                script {
+                    host_ip = sh(returnStdout: true, script: '/sbin/ip route | awk \'/default/ { print $3 ":${TEST_LOCAL_PORT}" }\'')
+                }
+            }
+        }
+
+        // Run the 3 tests on the currently running  Docker container
+        stage('Local tests') {
+            parallel {
+                stage('Curl http_code') {
+                    steps {
+                        curlRun ("http://${host_ip}", 'http_code')
+                    }
+                }
+                stage('Curl total_time') {
+                    steps {
+                        curlRun ("http://${host_ip}", 'total_time')
+                    }
+                }
+                stage('Curl size_download') {
+                    steps {
+                        curlRun ("http://${host_ip}", 'size_download')
+                    }
+                }
+            }
+        }
+
+        ////////// Step 3 I had used Checkmarx to validate the sast scanning //////////
+        stage('Checkmarx') {
+          environment {
+            CX_CREDS  = credentials('jenkins-checkmarx-cxsast-creds')
+          }
+          steps {
+            echo "Executing Checkmarx Jenkins Plugin to request a Scan..."
+          
+          }
+          step([$class: 'CxScanBuilder', comment: '', excludeFolders: '', excludeOpenSourceFolders: '', exclusionsSetting: 'job',
+            filterPattern: '''!**/_cvs/**/*, !**/.svn/**/*,   !**/.hg/**/*,   !**/.git/**/*,  !**/.bzr/**/*, !**/bin/**/*,
+              !**/obj/**/*,  !**/backup/**/*, !**/.idea/**/*, !**/*.DS_Store, !**/*.ipr,     !**/*.iws,
+              !**/*.bak,     !**/*.tmp,       !**/*.aac,      !**/*.aif,      !**/*.iff,     !**/*.m3u, !**/*.mid, !**/*.mp3,
+              !**/*.mpa,     !**/*.ra,        !**/*.wav,      !**/*.wma,      !**/*.3g2,     !**/*.3gp, !**/*.asf, !**/*.asx,
+              !**/*.avi,     !**/*.flv,       !**/*.mov,      !**/*.mp4,      !**/*.mpg,     !**/*.rm,  !**/*.swf, !**/*.vob,
+              !**/*.wmv,     !**/*.bmp,       !**/*.gif,      !**/*.jpg,      !**/*.png,     !**/*.psd, !**/*.tif, !**/*.swf,
+              !**/*.jar,     !**/*.zip,       !**/*.rar,      !**/*.exe,      !**/*.dll,     !**/*.pdb, !**/*.7z,  !**/*.gz,
+              !**/*.tar.gz,  !**/*.tar,       !**/*.gz,       !**/*.ahtm,     !**/*.ahtml,   !**/*.fhtml, !**/*.hdm,
+              !**/*.hdml,    !**/*.hsql,      !**/*.ht,       !**/*.hta,      !**/*.htc,     !**/*.htd, !**/*.war, !**/*.ear,
+              !**/*.htmls,   !**/*.ihtml,     !**/*.mht,      !**/*.mhtm,     !**/*.mhtml,   !**/*.ssi, !**/*.stm,
+              !**/*.stml,    !**/*.ttml,      !**/*.txn,      !**/*.xhtm,   !**/*.class, !**/*.iml, !Checkmarx/Reports/*.*''',
+            fullScanCycle: 10,
+            fullScansScheduled: true,
+            generatePdfReport: true,
+            generateXmlReport: true,
+            groupId: '111111111-1111-1111-6444-86gh407nv',
+            includeOpenSourceFolders: '',
+            osaEnabled: false,
+            username: "${CX_CREDS_USR}",
+            password: "${CX_CREDS_PSW}",
+            preset: '36',
+            projectName: "${params.CX_PROJECT_NAME}",
+            serverUrl: "${params.CX_SERVER_URL}",
+            sourceEncoding: '1',
+            waitForResultsEnabled: true,
+            vulnerabilityThresholdEnabled: true,
+            vulnerabilityThresholdResult: 'UNSTABLE',
+            highThreshold: 1,
+            lowThreshold: 2,
+            mediumThreshold: 1,
+            generatePdfReport: false])
+            }
+        ////////// Step 4 Deploy to Dev //////////
+        stage('Nginx App Deployment') {
+          steps {
+            script {
+              withKubeConfig([credentialsId: 'k8scluster',serverUrl: 'https://kubernetscluster.com:6443']) {
+                sh """
+                kubectl apply --recursive --filename nginx.yml
+                """                
+              }
+            }
+          }
+        }
+}
